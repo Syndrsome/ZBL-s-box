@@ -12,9 +12,31 @@
 #include "locker.h"
 #include "threadpool.h"
 #include"http_conn.h"
+#include"lst_timer.h"
 
 #define MAX_FD 65535
 #define MAX_EVENT_NUMBER 10000
+#define TIMESLOT 5
+
+static int pipefd[2];
+static int epollfd = 0;
+static sort_timer_list timer_lst;
+
+void sig_handler(int sig){
+    int save_errno = errno;
+    int msg = sig;
+    send(pipefd[1], (char*)&msg, 1, 0);
+    errno = save_errno;
+}
+
+void addsig(int sig){
+     struct  sigaction sa;
+    memset(&sa, '\0', sizeof(sa));
+    sa.sa_handler = sig_handler;
+    sa.sa_flags |= SA_RESTART;
+    sigfillset(&sa.sa_mask);
+    sigaction(sig, &sa, NULL);
+}
 
 void addsig(int sig, void(handler)(int)){
     struct  sigaction sa;
@@ -24,12 +46,25 @@ void addsig(int sig, void(handler)(int)){
     sigaction(sig, &sa, NULL);
 }
 
+
+void timer_handler(){
+    timer_lst.tick();
+    alarm(TIMESLOT);
+}
+
 //添加文件描述符到epoll
 extern void addfd(int epollfd, int fd, bool one_shot);
 //将epoll中的文件描述符删除
 extern void removefd(int epollfd, int fd);
 //修改文件描述符
 extern void modfd(int epollfd, int fd, int ev);
+
+extern int  setnonblocking(int fd);
+
+void cb_func(client_data* user_data){
+    removefd(epollfd, user_data->sockfd);
+    printf("close fd : %d\n",user_data->sockfd);
+}
 
 int main(int argc, char* argv[]){
     if(argc <= 1){
@@ -80,10 +115,26 @@ int main(int argc, char* argv[]){
 
     //epoll
     epoll_event event[MAX_EVENT_NUMBER];
-    int epollfd = epoll_create(5);
+    epollfd = epoll_create(5);
     //添加监听套接字到epoll
     addfd(epollfd, listenfd, false);
     http_conn::m_epollfd = epollfd;
+
+    int ret = socketpair(PF_UNIX, SOCK_STREAM, 0, pipefd);
+    if(ret == -1){
+        perror("socketpair");
+        exit(-1);
+    }
+    setnonblocking(pipefd[1]);
+    addfd(epollfd, pipefd[0], false);
+
+    addsig(SIGALRM);
+    bool stop_server = false;
+
+    client_data *user_data = new client_data[MAX_FD];  
+    bool timeout = false;
+    alarm(TIMESLOT);  
+
     
     while(1){
         int num = epoll_wait(epollfd, event, MAX_EVENT_NUMBER, -1);
@@ -112,10 +163,38 @@ int main(int argc, char* argv[]){
                 }
 
                 users[connfd].init(connfd, client_address);
+
+                user_data[connfd].address = client_address;
+                user_data[connfd].sockfd = connfd;
+                util_timer *timer = new util_timer;
+                timer->user_data = &user_data[connfd];
+                time_t cur = time(NULL);
+                timer->expire = cur + 3*TIMESLOT;
+                timer->cb_func = cb_func;
+                user_data[connfd].timer = timer;
+                timer_lst.add_timer(timer);
+
             }
             else if(event[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)){
                 users[sockfd].close_conn();
-            }else if(event[i].events & EPOLLIN) {
+            }else if( sockfd == pipefd[0] && event[i].events & EPOLLIN){
+                int sig;
+                char signals[1024];
+                ret = recv(sockfd, signals, sizeof(signals), 0);
+                if(ret == -1) continue;
+                else if(ret == 0) continue;
+                else{
+                    for(int i =0; i<ret; i++){
+                        switch(signals[i]){
+                            case SIGALRM:
+                            timeout = true;
+                            break;
+                        }
+                    }
+                }
+
+            }
+            else if(event[i].events & EPOLLIN) {
                 if(users[sockfd].read()){
                     pool->append(users + sockfd);
                     
@@ -128,12 +207,17 @@ int main(int argc, char* argv[]){
                 }
             }
         }
-
+        if(timeout){
+            timer_handler();
+            timeout = false;
+        }
 
     }
 
     close(epollfd);
     close(listenfd);
+    close(pipefd[0]);
+    close(pipefd[1]);
     delete [] users;
     delete pool;
 

@@ -18,7 +18,7 @@ const char* error_500_form = "There was an unusual problem serving the requested
 //网站根目录
 const char* doc_root = "/home/zhangbolin/linux/webser/resources";
 
-int setnonblocking(int fd){
+extern int setnonblocking(int fd){
     int old_flag = fcntl(fd, F_GETFL);
     int new_flag = old_flag | O_NONBLOCK;
     fcntl(fd, F_SETFL, new_flag);
